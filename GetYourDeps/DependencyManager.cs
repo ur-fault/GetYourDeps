@@ -1,5 +1,3 @@
-using System.Diagnostics;
-
 namespace GetYourDeps;
 
 public class DependencyManager : IDependencyManager, IDisposable
@@ -13,29 +11,86 @@ public class DependencyManager : IDependencyManager, IDisposable
 
     private class DependencyItem
     {
-        public DependencyItem(Type dependencyType, DependencyManager manager, Func<IDependencyManager, object> factory,
-            DependencyLifetime lifetime) {
+        private DependencyItem(Type dependencyType, DependencyManager manager,
+            Func<IDependencyManager, object>? factory, DependencyLifetime lifetime) {
             DependencyType = dependencyType;
             Factory = factory;
             Lifetime = lifetime;
             _manager = manager;
-            _threadLocalInstances = new(() => Factory(_manager));
+            _threadLocalInstances = new(() => Factory!(_manager));
+        }
+
+        private DependencyItem(Type dependencyType, DependencyManager manager, object instance,
+            DependencyLifetime lifetime) {
+            DependencyType = dependencyType;
+            _cachedInstance = instance;
+            Lifetime = lifetime;
+            _manager = manager;
+            _threadLocalInstances = new(() => Factory!(_manager));
+        }
+
+        public static DependencyItem CreateSingleton<T>(DependencyManager manager, Func<IDependencyManager, T> factory)
+            where T : class => new(typeof(T), manager, factory, DependencyLifetime.Singleton);
+
+        public static DependencyItem CreateSingleton<T>(DependencyManager manager, T instance)
+            where T : class => new(typeof(T), manager, instance, DependencyLifetime.Singleton);
+
+        public static DependencyItem CreateInstanced<T>(DependencyManager manager, Func<IDependencyManager, T> factory)
+            where T : class => new(typeof(T), manager, factory, DependencyLifetime.Instanced);
+
+        public static DependencyItem CreateInstanced<T>(DependencyManager manager, T instance)
+            where T : class, ICloneable => new(typeof(T), manager, instance, DependencyLifetime.Instanced);
+
+        public static DependencyItem CreateThreadLocal<T>(DependencyManager manager,
+            Func<IDependencyManager, T> factory)
+            where T : class => new(typeof(T), manager, factory, DependencyLifetime.ThreadLocal);
+
+        public static DependencyItem CreateThreadLocal<T>(DependencyManager manager, T instance)
+            where T : class, ICloneable => new(typeof(T), manager, instance, DependencyLifetime.ThreadLocal);
+
+        public static DependencyItem Create<T>(DependencyManager manager, DependencyLifetime lifetime,
+            T? instance = null, Func<IDependencyManager, T>? factory = null) where T : class {
+            return lifetime switch {
+                DependencyLifetime.Singleton => instance is not null
+                    ? CreateSingleton(manager, instance)
+                    : CreateSingleton(manager,
+                        factory ?? throw new InvalidOperationException(
+                            "Either factory or instance must be set to nonnull value")),
+                DependencyLifetime.Instanced => instance is not null
+                    ? CreateInstanced(manager, instance as ICloneable
+                                               ?? throw new InvalidOperationException(
+                                                   "Instance must implement ICloneable"))
+                    : CreateInstanced(manager,
+                        factory ?? throw new InvalidOperationException(
+                            "Either factory or instance must be set to nonnull value")),
+                DependencyLifetime.ThreadLocal => instance is not null
+                    ? CreateThreadLocal(manager, instance as ICloneable
+                                                 ?? throw new InvalidOperationException(
+                                                     "Instance must implement ICloneable"))
+                    : CreateThreadLocal(manager,
+                        factory ?? throw new InvalidOperationException(
+                            "Either factory or instance must be set to nonnull value")),
+                _ => throw new ArgumentOutOfRangeException(nameof(lifetime), lifetime, null)
+            };
         }
 
         public Type DependencyType { get; }
-        public Func<IDependencyManager, object> Factory { get; }
-        public DependencyLifetime Lifetime { get; set; }
+        public Func<IDependencyManager, object>? Factory { get; }
+        public DependencyLifetime Lifetime { get; }
 
         private DependencyManager _manager;
-        private object? _singletonInstance;
+        private object? _cachedInstance;
         private readonly ThreadLocal<object> _threadLocalInstances;
 
-        public object GetInstance(IDependencyManager manager) {
+        public object GetInstance() {
             return Lifetime switch {
-                DependencyLifetime.Singleton => _singletonInstance ??= Factory(manager),
-                DependencyLifetime.Instanced => Factory(manager),
-                DependencyLifetime.ThreadLocal => _threadLocalInstances.Value ?? throw new NullReferenceException(),
-                _ => throw new ArgumentOutOfRangeException()
+                DependencyLifetime.Singleton => _cachedInstance ??= Factory!.Invoke(_manager),
+                DependencyLifetime.Instanced => _cachedInstance is ICloneable cl
+                    ? cl.Clone()
+                    : Factory!.Invoke(_manager),
+                DependencyLifetime.ThreadLocal => _threadLocalInstances.Value ??
+                                                  throw new NullReferenceException(nameof(_threadLocalInstances.Value)),
+                _ => throw new ArgumentOutOfRangeException(),
             };
         }
     }
@@ -45,7 +100,7 @@ public class DependencyManager : IDependencyManager, IDisposable
 
     public IDependencyProvider IP => this;
     public IDependencyManager IM => this;
-    
+
     /// <summary>
     /// Shorthand for <see cref="GetDependency{T}"/>
     /// </summary>
@@ -59,7 +114,7 @@ public class DependencyManager : IDependencyManager, IDisposable
 
     public T? TryGetDependency<T>() where T : class {
         return RunLockedFunction(() =>
-            _dependencyItems.TryGetValue(typeof(T), out var dependency) ? (T)dependency.GetInstance(this) : null);
+            _dependencyItems.TryGetValue(typeof(T), out var dependency) ? (T)dependency.GetInstance() : null);
     }
 
     public IDependencyManager RegisterSingleton<T>(Func<IDependencyManager, T> factory, bool allowReregister = false)
@@ -80,28 +135,13 @@ public class DependencyManager : IDependencyManager, IDisposable
         return this;
     }
 
-    /// <summary>
-    /// Updates lifetime of registered dependency.
-    ///
-    /// Note: This method does NOT update or resets singleton or threadlocal instances.
-    /// </summary>
-    /// <param name="lifetime"></param>
-    /// <typeparam name="T"></typeparam>
-    /// <exception cref="DependencyNotRegisteredException"></exception>
-    public void UpdateLifetime<T>(DependencyLifetime lifetime) where T : class {
-        if (!_dependencyItems.ContainsKey(typeof(T)))
-            throw new DependencyNotRegisteredException(typeof(T));
-
-        _dependencyItems[typeof(T)].Lifetime = lifetime;
-    }
-
     private void Register<T>(Func<IDependencyManager, T> factory, DependencyLifetime lifetime,
         bool allowReregister) where T : class {
         RunLockedAction(() => {
             if (_dependencyItems.ContainsKey(typeof(T)) && !allowReregister)
                 throw new DependencyAlreadyRegisteredException(typeof(T));
 
-            _dependencyItems[typeof(T)] = new DependencyItem(typeof(T), this, factory, lifetime);
+            _dependencyItems[typeof(T)] = DependencyItem.Create(this, lifetime, factory: factory);
         });
     }
 
